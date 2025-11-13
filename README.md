@@ -1,0 +1,1 @@
+This is a simple AWS Lambda function that automatically fetches my recently played tracks from Spotify, stores them in a MongoDB Atlas database, and sends a notification through Amazon SNS.
