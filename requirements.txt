@@ -1,0 +1,4 @@
+spotipy
+pymongo
+boto3
+pytz
