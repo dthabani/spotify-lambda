@@ -78,7 +78,7 @@ def fetch_recent_tracks():
             duration_formatted = f"{minutes:02}:{seconds:02}"
 
             data = {
-                'artist': track['artists'][0]['name'],
+                'artists': [a['name'] for a in track['artists']], # List of artist names
                 'title': track['name'],
                 'played_at': local_time.strftime("%Y-%m-%d %H:%M:%S"),
                 'duration': duration_formatted,
