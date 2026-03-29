@@ -4,8 +4,7 @@ import boto3
 from spotipy import Spotify
 from spotipy.oauth2 import SpotifyOAuth
 from pymongo import MongoClient
-from datetime import datetime
-import pytz
+from datetime import datetime, timezone
 
 # Configure logging
 logger = logging.getLogger()
@@ -22,12 +21,13 @@ REFRESH_TOKEN = os.environ.get('SPOTIFY_REFRESH_TOKEN')
 MONGO_URI = os.environ['MONGO_URI']
 SNS_TOPIC_ARN = os.environ['SNS_TOPIC_ARN']
 
+# MongoDB Connection
 client = MongoClient(MONGO_URI, tlsAllowInvalidCertificates=True)
 db = client['spotify']
 collection = db['songs']
 
 def send_sns_notification(subject, message):
-    """Send an SNS notification."""
+    """Send an SNS notification on success or failure."""
     try:
         response = sns_client.publish(
             TopicArn=SNS_TOPIC_ARN,
@@ -39,6 +39,7 @@ def send_sns_notification(subject, message):
         logger.error(f"Error sending SNS notification: {str(e)}")
 
 def get_spotify_client():
+    """Authenticate with Spotify using the stored Refresh Token."""
     sp_oauth = SpotifyOAuth(
         client_id=CLIENT_ID,
         client_secret=CLIENT_SECRET,
@@ -47,7 +48,7 @@ def get_spotify_client():
     )
 
     if not REFRESH_TOKEN:
-        raise Exception("Refresh token not found. Please authenticate locally and store the refresh token.")
+        raise Exception("Refresh token not found in environment variables.")
 
     token_info = sp_oauth.refresh_access_token(REFRESH_TOKEN)
     access_token = token_info.get('access_token')
@@ -58,33 +59,64 @@ def get_spotify_client():
     return Spotify(auth=access_token)
 
 def fetch_recent_tracks():
+    """Fetch tracks, calculate true play times, and load into MongoDB."""
     logger.info("Fetching recently played tracks...")
     try:
         sp = get_spotify_client()
         recent_tracks = sp.current_user_recently_played(limit=50)
-        gmt_plus_8 = pytz.timezone('Asia/Singapore')
+        items = recent_tracks.get('items', [])
+        
+        if not items:
+            logger.info("No tracks found.")
+            return
 
-        for item in recent_tracks['items']:
-            track = item['track']
+        for item in items:
+            played_at_str = item['played_at']
+            # Handle timestamps with or without fractional seconds
             try:
-                utc_time = datetime.strptime(item['played_at'], "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=pytz.utc)
+                dt = datetime.strptime(played_at_str, "%Y-%m-%dT%H:%M:%S.%fZ")
             except ValueError:
-                # Handle timestamps without fractional seconds
-                utc_time = datetime.strptime(item['played_at'], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=pytz.utc)
-            local_time = utc_time.astimezone(gmt_plus_8)
-            duration_ms = track['duration_ms']
-            minutes = duration_ms // 60000
-            seconds = (duration_ms % 60000) // 1000
-            duration_formatted = f"{minutes:02}:{seconds:02}"
+                dt = datetime.strptime(played_at_str, "%Y-%m-%dT%H:%M:%SZ")
+            
+            # Force UTC awareness
+            item['utc_time'] = dt.replace(tzinfo=timezone.utc)
+
+        for i, item in enumerate(items):
+            track = item['track']
+            
+            duration_seconds = track['duration_ms'] // 1000
+            time_taken = duration_seconds
+            
+            # If there is a track played BEFORE this one (index i + 1), calculate the difference
+            if i < len(items) - 1:
+                older_item = items[i + 1]
+                time_diff = item['utc_time'] - older_item['utc_time']
+                diff_seconds = int(time_diff.total_seconds())
+                
+                # Time taken is the minimum of the track's full length or the time before the next skip
+                time_taken = min(duration_seconds, diff_seconds)
+
+            # Extract image and artist IDs
+            images = track['album'].get('images', [])
+            album_cover = images[1]['url'] if len(images) > 1 else (images[0]['url'] if images else None)
+            artist_data = [{'name': a['name'], 'id': a['id']} for a in track['artists']]
 
             data = {
-                'artists': [a['name'] for a in track['artists']], # List of artist names
+                'track_id': track['id'],
                 'title': track['name'],
-                'played_at': local_time.strftime("%Y-%m-%d %H:%M:%S"),
-                'duration': duration_formatted,
+                'artists': [a['name'] for a in artist_data],
+                'artist_ids': [a['id'] for a in artist_data],
                 'album': track['album']['name'],
+                'album_id': track['album']['id'],
+                'album_cover_url': album_cover,
+                'played_at': item['utc_time'],
+                'duration': duration_seconds,
+                'time_taken': time_taken
             }
-            logger.info(f"Inserting data: {data}")
+            
+            logger.info(f"Inserting: {data['title']} | Listened for {time_taken} seconds out of {duration_seconds} seconds")
+            
+            # Upsert into MongoDB using the absolute UTC datetime as the unique identifier
             collection.update_one({'played_at': data['played_at']}, {'$set': data}, upsert=True)
 
         logger.info("Recently played tracks successfully stored in MongoDB!")
